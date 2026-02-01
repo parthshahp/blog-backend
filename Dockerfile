@@ -8,6 +8,7 @@ RUN rm -rf src
 
 COPY src ./src
 COPY data ./data
+COPY data ./seed
 RUN cargo build --release
 
 FROM debian:bookworm-slim
