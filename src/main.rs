@@ -1,5 +1,13 @@
 use anyhow::Context;
-use axum::{extract::State, routing::get, Json, Router};
+use axum::{
+    body::Body,
+    extract::State,
+    http::{Request, StatusCode},
+    middleware::{self, Next},
+    response::Response,
+    routing::get,
+    Json, Router,
+};
 use chrono::NaiveDate;
 use reqwest::Client;
 use rss::{extension::ExtensionMap, Channel, Item};
@@ -21,6 +29,13 @@ struct AppState {
     storage: Arc<RwLock<Storage>>,
     client: Client,
     rss_url: String,
+    allowlist: AllowList,
+}
+
+#[derive(Clone, Default)]
+struct AllowList {
+    origins: Option<HashSet<String>>,
+    hosts: Option<HashSet<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -29,6 +44,7 @@ struct Movie {
     watched_date: String,
     rating: Option<f32>,
     link: String,
+    poster_url: Option<String>,
 }
 
 struct Storage {
@@ -76,6 +92,8 @@ async fn main() -> anyhow::Result<()> {
 
     let rss_url = env::var("RSS_URL").unwrap_or_else(|_| "https://letterboxd.com/istangel/rss/".to_string());
     let data_path = env::var("DATA_PATH").unwrap_or_else(|_| "data/movies.json".to_string());
+    let allowed_origins = parse_allowlist(env::var("ALLOWED_ORIGINS").ok());
+    let allowed_hosts = parse_allowlist(env::var("ALLOWED_HOSTS").ok());
     let port: u16 = env::var("PORT")
         .unwrap_or_else(|_| "3000".to_string())
         .parse()
@@ -87,6 +105,8 @@ async fn main() -> anyhow::Result<()> {
         seed = "none",
         rss_url = %rss_url,
         %port,
+        allowed_origins = %allowlist_display(&allowed_origins),
+        allowed_hosts = %allowlist_display(&allowed_hosts),
         "starting blog-backend"
     );
 
@@ -98,6 +118,10 @@ async fn main() -> anyhow::Result<()> {
         storage: Arc::new(RwLock::new(storage)),
         client: Client::builder().user_agent("blog-backend/0.1").build()?,
         rss_url,
+        allowlist: AllowList {
+            origins: allowed_origins,
+            hosts: allowed_hosts,
+        },
     };
 
     let bg_state = app_state.clone();
@@ -120,7 +144,11 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/movies", get(list_movies))
-        .with_state(app_state);
+        .with_state(app_state.clone())
+        .layer(middleware::from_fn_with_state(
+            app_state,
+            restrict_requests,
+        ));
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = tokio::net::TcpListener::bind(addr)
@@ -140,6 +168,40 @@ async fn healthz() -> &'static str {
 async fn list_movies(State(state): State<AppState>) -> Json<Vec<Movie>> {
     let storage = state.storage.read().await;
     Json(storage.movies.clone())
+}
+
+async fn restrict_requests(
+    State(state): State<AppState>,
+    req: Request<Body>,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    if let Some(allowed) = state.allowlist.origins.as_ref() {
+        if let Some(origin) = req.headers().get(axum::http::header::ORIGIN) {
+            let origin = origin
+                .to_str()
+                .map_err(|_| StatusCode::BAD_REQUEST)?
+                .trim();
+            if !is_origin_allowed(origin, allowed) {
+                return Err(StatusCode::FORBIDDEN);
+            }
+        }
+    }
+
+    if let Some(allowed) = state.allowlist.hosts.as_ref() {
+        let host = req
+            .headers()
+            .get(axum::http::header::HOST)
+            .ok_or(StatusCode::FORBIDDEN)?
+            .to_str()
+            .map_err(|_| StatusCode::BAD_REQUEST)?
+            .trim();
+        let host_no_port = host.split(':').next().unwrap_or(host);
+        if !allowed.contains(host) && !allowed.contains(host_no_port) {
+            return Err(StatusCode::FORBIDDEN);
+        }
+    }
+
+    Ok(next.run(req).await)
 }
 
 
@@ -197,11 +259,13 @@ fn movie_from_item(item: &Item) -> Option<Movie> {
         .or_else(|| item.title().map(|t| t.to_string()))
         .unwrap_or_else(|| link.clone());
     let rating = get_ext(exts, "letterboxd", "memberRating").and_then(|r| r.parse().ok());
+    let poster_url = extract_poster_url(item.description());
     Some(Movie {
         link,
         rating,
         name,
         watched_date,
+        poster_url,
     })
 }
 
@@ -210,4 +274,61 @@ fn get_ext(exts: &ExtensionMap, namespace: &str, name: &str) -> Option<String> {
         .and_then(|map| map.get(name))
         .and_then(|values| values.first())
         .and_then(|ext| ext.value.clone())
+}
+
+fn extract_poster_url(description: Option<&str>) -> Option<String> {
+    let description = description?;
+    let img_tag = description.split("<img").nth(1)?;
+    let src_part = img_tag.split("src=\"").nth(1)?;
+    let url = src_part.split('"').next()?.trim();
+    if url.is_empty() {
+        None
+    } else {
+        Some(url.to_string())
+    }
+}
+
+fn parse_allowlist(raw: Option<String>) -> Option<HashSet<String>> {
+    let raw = raw?;
+    let mut set = HashSet::new();
+    for value in raw.split(',') {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            set.insert(trimmed.to_string());
+        }
+    }
+    if set.is_empty() { None } else { Some(set) }
+}
+
+fn allowlist_display(list: &Option<HashSet<String>>) -> String {
+    match list {
+        Some(values) if !values.is_empty() => {
+            let mut items: Vec<_> = values.iter().cloned().collect();
+            items.sort();
+            items.join(",")
+        }
+        _ => "none".to_string(),
+    }
+}
+
+fn is_origin_allowed(origin: &str, allowed: &HashSet<String>) -> bool {
+    if allowed.contains(origin) {
+        return true;
+    }
+
+    if !allowed.contains("localhost") {
+        return false;
+    }
+
+    let origin = origin.trim();
+    let rest = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"));
+    let rest = match rest {
+        Some(value) => value,
+        None => return false,
+    };
+    let host = rest.split('/').next().unwrap_or(rest);
+    let host = host.split(':').next().unwrap_or(host);
+    host == "localhost"
 }
