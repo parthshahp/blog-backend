@@ -1,0 +1,17 @@
+[env]
+RUST_LOG = "info,hyper=warn"
+PORT = "3001"
+DATA_PATH = "data/movies.json"
+RSS_URL = "https://letterboxd.com/istangel/rss/"
+
+[tasks.dev]
+run = "cargo run"
+
+[tasks.fmt]
+run = "cargo fmt"
+
+[tasks.clippy]
+run = "cargo clippy --all-targets --all-features -- -D warnings"
+
+[tasks.test]
+run = "cargo test"
