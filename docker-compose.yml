@@ -1,0 +1,17 @@
+services:
+  blog-backend:
+    build: .
+    container_name: blog-backend
+    restart: unless-stopped
+
+    environment:
+      PORT: "3000"
+      DATA_PATH: "/data/movies.json"
+      RSS_URL: "https://letterboxd.com/istangel/rss/"
+      RUST_LOG: "info"
+
+    ports:
+      - "3000:3000"
+
+    volumes:
+      - /srv/blog-backend/data:/data
