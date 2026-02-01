@@ -1,3 +1,4 @@
+use anyhow::Context;
 use axum::{extract::State, routing::get, Json, Router};
 use chrono::NaiveDate;
 use reqwest::Client;
@@ -67,6 +68,7 @@ impl Storage {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
+        .with_ansi(false)
         .with_env_filter(
             env::var("RUST_LOG").unwrap_or_else(|_| "info,hyper=warn".to_string()),
         )
@@ -80,7 +82,18 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(3000);
 
     let data_path = PathBuf::from(data_path);
-    let storage = Storage::load(data_path).await?;
+    info!(
+        data_path = %data_path.display(),
+        seed = "none",
+        rss_url = %rss_url,
+        %port,
+        "starting blog-backend"
+    );
+
+    let storage = Storage::load(data_path.clone())
+        .await
+        .context("loading data file")?;
+    info!(count = storage.movies.len(), "loaded movies");
     let app_state = AppState {
         storage: Arc::new(RwLock::new(storage)),
         client: Client::builder().user_agent("blog-backend/0.1").build()?,
@@ -110,8 +123,13 @@ async fn main() -> anyhow::Result<()> {
         .with_state(app_state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .context("binding listen address")?;
     info!(%port, "server listening");
-    axum::serve(tokio::net::TcpListener::bind(addr).await?, app).await?;
+    axum::serve(listener, app)
+        .await
+        .context("serving http")?;
     Ok(())
 }
 
