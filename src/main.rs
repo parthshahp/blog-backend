@@ -21,7 +21,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::{fs, sync::RwLock, time};
+use tokio::{fs, io::AsyncWriteExt, sync::RwLock, time};
 use tracing::{info, warn};
 
 #[derive(Clone)]
@@ -72,7 +72,18 @@ impl Storage {
             fs::create_dir_all(parent).await?;
         }
         let bytes = serde_json::to_vec_pretty(&self.movies)?;
-        fs::write(&self.path, bytes).await?;
+        let tmp_path = match self.path.file_name() {
+            Some(name) => {
+                let mut tmp = self.path.clone();
+                tmp.set_file_name(format!("{}.tmp", name.to_string_lossy()));
+                tmp
+            }
+            None => self.path.with_extension("tmp"),
+        };
+        let mut file = fs::File::create(&tmp_path).await?;
+        file.write_all(&bytes).await?;
+        file.sync_all().await?;
+        fs::rename(&tmp_path, &self.path).await?;
         Ok(())
     }
 
@@ -116,13 +127,18 @@ async fn main() -> anyhow::Result<()> {
     info!(count = storage.movies.len(), "loaded movies");
     let app_state = AppState {
         storage: Arc::new(RwLock::new(storage)),
-        client: Client::builder().user_agent("blog-backend/0.1").build()?,
+        client: Client::builder()
+            .user_agent("blog-backend/0.1")
+            .timeout(Duration::from_secs(10))
+            .build()?,
         rss_url,
         allowlist: AllowList {
             origins: allowed_origins,
             hosts: allowed_hosts,
         },
     };
+
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(());
 
     let bg_state = app_state.clone();
     tokio::spawn(async move {
@@ -134,9 +150,15 @@ async fn main() -> anyhow::Result<()> {
         let mut interval = time::interval_at(next_tick, Duration::from_secs(60 * 60 * 24));
         interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
         loop {
-            interval.tick().await;
-            if let Err(err) = refresh_from_rss(&bg_state).await {
-                warn!(error = %err, "scheduled rss refresh failed");
+            tokio::select! {
+                _ = shutdown_rx.changed() => {
+                    break;
+                }
+                _ = interval.tick() => {
+                    if let Err(err) = refresh_from_rss(&bg_state).await {
+                        warn!(error = %err, "scheduled rss refresh failed");
+                    }
+                }
             }
         }
     });
@@ -155,7 +177,12 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("binding listen address")?;
     info!(%port, "server listening");
+    let shutdown = async move {
+        shutdown_signal().await;
+        let _ = shutdown_tx.send(());
+    };
     axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
         .await
         .context("serving http")?;
     Ok(())
@@ -175,6 +202,21 @@ async fn restrict_requests(
     req: Request<Body>,
     next: Next,
 ) -> Result<Response, StatusCode> {
+    if let Ok(api_key) = env::var("API_KEY") {
+        let auth = req
+            .headers()
+            .get(axum::http::header::AUTHORIZATION)
+            .ok_or(StatusCode::UNAUTHORIZED)?;
+        let auth = auth
+            .to_str()
+            .map_err(|_| StatusCode::BAD_REQUEST)?
+            .trim();
+        let token = auth.strip_prefix("Bearer ").unwrap_or(auth);
+        if token != api_key {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    }
+
     if let Some(allowed) = state.allowlist.origins.as_ref() {
         if let Some(origin) = req.headers().get(axum::http::header::ORIGIN) {
             let origin = origin
@@ -204,6 +246,29 @@ async fn restrict_requests(
     Ok(next.run(req).await)
 }
 
+async fn shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+    #[cfg(unix)]
+    {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = ctrl_c => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(err) => {
+                warn!(error = %err, "failed to install SIGTERM handler");
+                ctrl_c.await.ok();
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    ctrl_c.await.ok();
+
+    info!("shutdown signal received");
+}
 
 async fn refresh_from_rss(state: &AppState) -> anyhow::Result<usize> {
     info!("refreshing rss feed");
