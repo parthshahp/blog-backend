@@ -8,7 +8,7 @@ use std::{
     env,
     io::Cursor,
     net::SocketAddr,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::Arc,
     time::Duration,
 };
@@ -41,6 +41,10 @@ impl Storage {
             let bytes = fs::read(&path).await?;
             serde_json::from_slice::<Vec<Movie>>(&bytes)?
         } else {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).await?;
+            }
+            fs::write(&path, b"[]\n").await?;
             Vec::new()
         };
         Ok(Self { path, movies })
@@ -70,16 +74,12 @@ async fn main() -> anyhow::Result<()> {
 
     let rss_url = env::var("RSS_URL").unwrap_or_else(|_| "https://letterboxd.com/istangel/rss/".to_string());
     let data_path = env::var("DATA_PATH").unwrap_or_else(|_| "data/movies.json".to_string());
-    let seed_path = env::var("SEED_PATH").unwrap_or_else(|_| "seed/movies.json".to_string());
     let port: u16 = env::var("PORT")
         .unwrap_or_else(|_| "3000".to_string())
         .parse()
         .unwrap_or(3000);
 
     let data_path = PathBuf::from(data_path);
-    let seed_path = PathBuf::from(seed_path);
-    seed_data_file(&data_path, &seed_path).await?;
-
     let storage = Storage::load(data_path).await?;
     let app_state = AppState {
         storage: Arc::new(RwLock::new(storage)),
@@ -124,20 +124,6 @@ async fn list_movies(State(state): State<AppState>) -> Json<Vec<Movie>> {
     Json(storage.movies.clone())
 }
 
-async fn seed_data_file(data_path: &Path, seed_path: &Path) -> anyhow::Result<()> {
-    if fs::try_exists(data_path).await? {
-        return Ok(());
-    }
-    if !fs::try_exists(seed_path).await? {
-        return Ok(());
-    }
-    if let Some(parent) = data_path.parent() {
-        fs::create_dir_all(parent).await?;
-    }
-    let bytes = fs::read(seed_path).await?;
-    fs::write(data_path, bytes).await?;
-    Ok(())
-}
 
 async fn refresh_from_rss(state: &AppState) -> anyhow::Result<usize> {
     info!("refreshing rss feed");
