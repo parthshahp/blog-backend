@@ -29,13 +29,6 @@ struct AppState {
     storage: Arc<RwLock<Storage>>,
     client: Client,
     rss_url: String,
-    allowlist: AllowList,
-}
-
-#[derive(Clone, Default)]
-struct AllowList {
-    origins: Option<HashSet<String>>,
-    hosts: Option<HashSet<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -103,8 +96,6 @@ async fn main() -> anyhow::Result<()> {
 
     let rss_url = env::var("RSS_URL").unwrap_or_else(|_| "https://letterboxd.com/istangel/rss/".to_string());
     let data_path = env::var("DATA_PATH").unwrap_or_else(|_| "data/movies.json".to_string());
-    let allowed_origins = parse_allowlist(env::var("ALLOWED_ORIGINS").ok());
-    let allowed_hosts = parse_allowlist(env::var("ALLOWED_HOSTS").ok());
     let port: u16 = env::var("PORT")
         .unwrap_or_else(|_| "3000".to_string())
         .parse()
@@ -116,8 +107,6 @@ async fn main() -> anyhow::Result<()> {
         seed = "none",
         rss_url = %rss_url,
         %port,
-        allowed_origins = %allowlist_display(&allowed_origins),
-        allowed_hosts = %allowlist_display(&allowed_hosts),
         "starting blog-backend"
     );
 
@@ -132,10 +121,6 @@ async fn main() -> anyhow::Result<()> {
             .timeout(Duration::from_secs(10))
             .build()?,
         rss_url,
-        allowlist: AllowList {
-            origins: allowed_origins,
-            hosts: allowed_hosts,
-        },
     };
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(());
@@ -214,32 +199,6 @@ async fn restrict_requests(
         let token = auth.strip_prefix("Bearer ").unwrap_or(auth);
         if token != api_key {
             return Err(StatusCode::UNAUTHORIZED);
-        }
-    }
-
-    if let Some(allowed) = state.allowlist.origins.as_ref() {
-        if let Some(origin) = req.headers().get(axum::http::header::ORIGIN) {
-            let origin = origin
-                .to_str()
-                .map_err(|_| StatusCode::BAD_REQUEST)?
-                .trim();
-            if !is_origin_allowed(origin, allowed) {
-                return Err(StatusCode::FORBIDDEN);
-            }
-        }
-    }
-
-    if let Some(allowed) = state.allowlist.hosts.as_ref() {
-        let host = req
-            .headers()
-            .get(axum::http::header::HOST)
-            .ok_or(StatusCode::FORBIDDEN)?
-            .to_str()
-            .map_err(|_| StatusCode::BAD_REQUEST)?
-            .trim();
-        let host_no_port = host.split(':').next().unwrap_or(host);
-        if !allowed.contains(host) && !allowed.contains(host_no_port) {
-            return Err(StatusCode::FORBIDDEN);
         }
     }
 
@@ -351,49 +310,4 @@ fn extract_poster_url(description: Option<&str>) -> Option<String> {
     } else {
         Some(url.to_string())
     }
-}
-
-fn parse_allowlist(raw: Option<String>) -> Option<HashSet<String>> {
-    let raw = raw?;
-    let mut set = HashSet::new();
-    for value in raw.split(',') {
-        let trimmed = value.trim();
-        if !trimmed.is_empty() {
-            set.insert(trimmed.to_string());
-        }
-    }
-    if set.is_empty() { None } else { Some(set) }
-}
-
-fn allowlist_display(list: &Option<HashSet<String>>) -> String {
-    match list {
-        Some(values) if !values.is_empty() => {
-            let mut items: Vec<_> = values.iter().cloned().collect();
-            items.sort();
-            items.join(",")
-        }
-        _ => "none".to_string(),
-    }
-}
-
-fn is_origin_allowed(origin: &str, allowed: &HashSet<String>) -> bool {
-    if allowed.contains(origin) {
-        return true;
-    }
-
-    if !allowed.contains("localhost") {
-        return false;
-    }
-
-    let origin = origin.trim();
-    let rest = origin
-        .strip_prefix("http://")
-        .or_else(|| origin.strip_prefix("https://"));
-    let rest = match rest {
-        Some(value) => value,
-        None => return false,
-    };
-    let host = rest.split('/').next().unwrap_or(rest);
-    let host = host.split(':').next().unwrap_or(host);
-    host == "localhost"
 }
