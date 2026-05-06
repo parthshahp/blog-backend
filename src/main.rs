@@ -1,35 +1,16 @@
 use anyhow::Context;
-use axum::{
-    body::Body,
-    extract::State,
-    http::{Request, StatusCode},
-    middleware::{self, Next},
-    response::Response,
-    routing::get,
-    Json, Router,
-};
 use chrono::NaiveDate;
 use reqwest::Client;
-use rss::{extension::ExtensionMap, Channel, Item};
+use rss::{Channel, Item, extension::ExtensionMap};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     env,
     io::Cursor,
-    net::SocketAddr,
-    path::PathBuf,
-    sync::Arc,
     time::Duration,
 };
-use tokio::{fs, io::AsyncWriteExt, sync::RwLock, time};
+use tokio::time;
 use tracing::{info, warn};
-
-#[derive(Clone)]
-struct AppState {
-    storage: Arc<RwLock<Storage>>,
-    client: Client,
-    rss_url: String,
-}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct Movie {
@@ -40,48 +21,92 @@ struct Movie {
     poster_url: Option<String>,
 }
 
+const GIST_FILENAME: &str = "movies.json";
+
+#[derive(Deserialize)]
+struct GistResponse {
+    files: HashMap<String, GistFile>,
+}
+
+#[derive(Deserialize)]
+struct GistFile {
+    content: String,
+}
+
+#[derive(Serialize)]
+struct GistUpdate {
+    files: HashMap<String, GistFileContent>,
+}
+
+#[derive(Serialize)]
+struct GistFileContent {
+    content: String,
+}
+
 struct Storage {
-    path: PathBuf,
+    gist_id: String,
+    github_token: String,
+    client: Client,
     movies: Vec<Movie>,
 }
 
 impl Storage {
-    async fn load(path: PathBuf) -> anyhow::Result<Self> {
-        let movies = if fs::try_exists(&path).await? {
-            let bytes = fs::read(&path).await?;
-            serde_json::from_slice::<Vec<Movie>>(&bytes)?
-        } else {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).await?;
-            }
-            fs::write(&path, b"[]\n").await?;
-            Vec::new()
-        };
-        Ok(Self { path, movies })
+    async fn load(client: Client, gist_id: String, github_token: String) -> anyhow::Result<Self> {
+        let response = client
+            .get(format!("https://api.github.com/gists/{gist_id}"))
+            .header("Authorization", format!("Bearer {github_token}"))
+            .header("Accept", "application/vnd.github+json")
+            .send()
+            .await
+            .context("fetching gist")?;
+
+        if !response.status().is_success() {
+            anyhow::bail!("gist fetch failed with status {}", response.status());
+        }
+
+        let gist: GistResponse = response.json().await.context("parsing gist response")?;
+        let movies = gist
+            .files
+            .get(GIST_FILENAME)
+            .map(|f| serde_json::from_str::<Vec<Movie>>(&f.content))
+            .transpose()
+            .context("parsing movies from gist")?
+            .unwrap_or_default();
+
+        Ok(Self {
+            gist_id,
+            github_token,
+            client,
+            movies,
+        })
     }
 
     async fn save(&self) -> anyhow::Result<()> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).await?;
+        let content = serde_json::to_string_pretty(&self.movies)?;
+        let mut files = HashMap::new();
+        files.insert(GIST_FILENAME.to_string(), GistFileContent { content });
+        let update = GistUpdate { files };
+
+        let response = self
+            .client
+            .patch(format!("https://api.github.com/gists/{}", self.gist_id))
+            .header("Authorization", format!("Bearer {}", self.github_token))
+            .header("Accept", "application/vnd.github+json")
+            .json(&update)
+            .send()
+            .await
+            .context("patching gist")?;
+
+        if !response.status().is_success() {
+            anyhow::bail!("gist patch failed with status {}", response.status());
         }
-        let bytes = serde_json::to_vec_pretty(&self.movies)?;
-        let tmp_path = match self.path.file_name() {
-            Some(name) => {
-                let mut tmp = self.path.clone();
-                tmp.set_file_name(format!("{}.tmp", name.to_string_lossy()));
-                tmp
-            }
-            None => self.path.with_extension("tmp"),
-        };
-        let mut file = fs::File::create(&tmp_path).await?;
-        file.write_all(&bytes).await?;
-        file.sync_all().await?;
-        fs::rename(&tmp_path, &self.path).await?;
+
         Ok(())
     }
 
     fn sort_movies(&mut self) {
-        self.movies.sort_by(|a, b| b.watched_date.cmp(&a.watched_date));
+        self.movies
+            .sort_by(|a, b| b.watched_date.cmp(&a.watched_date));
     }
 }
 
@@ -89,120 +114,50 @@ impl Storage {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_ansi(false)
-        .with_env_filter(
-            env::var("RUST_LOG").unwrap_or_else(|_| "info,hyper=warn".to_string()),
-        )
+        .with_env_filter(env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()))
         .init();
 
-    let rss_url = env::var("RSS_URL").unwrap_or_else(|_| "https://letterboxd.com/istangel/rss/".to_string());
-    let data_path = env::var("DATA_PATH").unwrap_or_else(|_| "data/movies.json".to_string());
-    let port: u16 = env::var("PORT")
-        .unwrap_or_else(|_| "3000".to_string())
-        .parse()
-        .unwrap_or(3000);
+    let rss_url =
+        env::var("RSS_URL").unwrap_or_else(|_| "https://letterboxd.com/istangel/rss/".to_string());
+    let github_token = env::var("GITHUB_TOKEN").context("GITHUB_TOKEN not set")?;
+    let gist_id = env::var("GIST_ID").context("GIST_ID not set")?;
 
-    let data_path = PathBuf::from(data_path);
-    info!(
-        data_path = %data_path.display(),
-        seed = "none",
-        rss_url = %rss_url,
-        %port,
-        "starting blog-backend"
-    );
+    info!(gist_id = %gist_id, rss_url = %rss_url, "starting letterboxd-gist-sync");
 
-    let storage = Storage::load(data_path.clone())
+    let client = Client::builder()
+        .user_agent("blog-backend/0.1")
+        .timeout(Duration::from_secs(10))
+        .build()?;
+
+    let mut storage = Storage::load(client.clone(), gist_id, github_token)
         .await
-        .context("loading data file")?;
-    info!(count = storage.movies.len(), "loaded movies");
-    let app_state = AppState {
-        storage: Arc::new(RwLock::new(storage)),
-        client: Client::builder()
-            .user_agent("blog-backend/0.1")
-            .timeout(Duration::from_secs(10))
-            .build()?,
-        rss_url,
-    };
+        .context("loading gist")?;
+    info!(count = storage.movies.len(), "loaded movies from gist");
 
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(());
+    if let Err(err) = refresh_from_rss(&mut storage, &client, &rss_url).await {
+        warn!(error = %err, "initial rss refresh failed");
+    }
 
-    let bg_state = app_state.clone();
-    tokio::spawn(async move {
-        if let Err(err) = refresh_from_rss(&bg_state).await {
-            warn!(error = %err, "initial rss refresh failed");
-        }
+    let mut interval = time::interval(Duration::from_secs(60 * 60 * 24));
+    interval.tick().await; // consume the immediate first tick
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
 
-        let next_tick = time::Instant::now() + Duration::from_secs(60 * 60 * 24);
-        let mut interval = time::interval_at(next_tick, Duration::from_secs(60 * 60 * 24));
-        interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
-        loop {
-            tokio::select! {
-                _ = shutdown_rx.changed() => {
-                    break;
-                }
-                _ = interval.tick() => {
-                    if let Err(err) = refresh_from_rss(&bg_state).await {
-                        warn!(error = %err, "scheduled rss refresh failed");
-                    }
+    loop {
+        tokio::select! {
+            () = &mut shutdown => {
+                info!("shutting down");
+                break;
+            }
+            _ = interval.tick() => {
+                if let Err(err) = refresh_from_rss(&mut storage, &client, &rss_url).await {
+                    warn!(error = %err, "scheduled rss refresh failed");
                 }
             }
         }
-    });
-
-    let app = Router::new()
-        .route("/healthz", get(healthz))
-        .route("/movies", get(list_movies))
-        .with_state(app_state.clone())
-        .layer(middleware::from_fn_with_state(
-            app_state,
-            restrict_requests,
-        ));
-
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .context("binding listen address")?;
-    info!(%port, "server listening");
-    let shutdown = async move {
-        shutdown_signal().await;
-        let _ = shutdown_tx.send(());
-    };
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
-        .await
-        .context("serving http")?;
-    Ok(())
-}
-
-async fn healthz() -> &'static str {
-    "ok"
-}
-
-async fn list_movies(State(state): State<AppState>) -> Json<Vec<Movie>> {
-    let storage = state.storage.read().await;
-    Json(storage.movies.clone())
-}
-
-async fn restrict_requests(
-    State(state): State<AppState>,
-    req: Request<Body>,
-    next: Next,
-) -> Result<Response, StatusCode> {
-    if let Ok(api_key) = env::var("API_KEY") {
-        let auth = req
-            .headers()
-            .get(axum::http::header::AUTHORIZATION)
-            .ok_or(StatusCode::UNAUTHORIZED)?;
-        let auth = auth
-            .to_str()
-            .map_err(|_| StatusCode::BAD_REQUEST)?
-            .trim();
-        let token = auth.strip_prefix("Bearer ").unwrap_or(auth);
-        if token != api_key {
-            return Err(StatusCode::UNAUTHORIZED);
-        }
     }
 
-    Ok(next.run(req).await)
+    Ok(())
 }
 
 async fn shutdown_signal() {
@@ -222,23 +177,23 @@ async fn shutdown_signal() {
             }
         }
     }
-
     #[cfg(not(unix))]
     ctrl_c.await.ok();
-
-    info!("shutdown signal received");
 }
 
-async fn refresh_from_rss(state: &AppState) -> anyhow::Result<usize> {
+async fn refresh_from_rss(
+    storage: &mut Storage,
+    client: &Client,
+    rss_url: &str,
+) -> anyhow::Result<usize> {
     info!("refreshing rss feed");
-    let response = state.client.get(&state.rss_url).send().await?;
+    let response = client.get(rss_url).send().await?;
     if !response.status().is_success() {
         anyhow::bail!("rss fetch failed with status {}", response.status());
     }
     let bytes = response.bytes().await?;
     let channel = Channel::read_from(Cursor::new(bytes))?;
 
-    let mut storage = state.storage.write().await;
     let mut existing: HashSet<(String, String)> = storage
         .movies
         .iter()
@@ -255,16 +210,16 @@ async fn refresh_from_rss(state: &AppState) -> anyhow::Result<usize> {
         }
     }
 
-    if !new_movies.is_empty() {
+    if new_movies.is_empty() {
+        info!("no new movies");
+        Ok(0)
+    } else {
         let count = new_movies.len();
         storage.movies.extend(new_movies);
         storage.sort_movies();
         storage.save().await?;
         info!(%count, "stored new movies");
         Ok(count)
-    } else {
-        info!("no new movies");
-        Ok(0)
     }
 }
 
@@ -280,15 +235,15 @@ fn movie_from_item(item: &Item) -> Option<Movie> {
         return None;
     }
     let name = get_ext(exts, "letterboxd", "filmTitle")
-        .or_else(|| item.title().map(|t| t.to_string()))
+        .or_else(|| item.title().map(ToString::to_string))
         .unwrap_or_else(|| link.clone());
     let rating = get_ext(exts, "letterboxd", "memberRating").and_then(|r| r.parse().ok());
     let poster_url = extract_poster_url(item.description());
     Some(Movie {
-        link,
-        rating,
         name,
         watched_date,
+        rating,
+        link,
         poster_url,
     })
 }
