@@ -116,8 +116,7 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()))
         .init();
 
-    let rss_url =
-        env::var("RSS_URL").unwrap_or_else(|_| "https://letterboxd.com/istangel/rss/".to_string());
+    let rss_url = env::var("RSS_URL").context("RSS_URL not set")?;
     let github_token = env::var("GITHUB_TOKEN").context("GITHUB_TOKEN not set")?;
     let gist_id = env::var("GIST_ID").context("GIST_ID not set")?;
 
