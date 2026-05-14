@@ -9,8 +9,7 @@ use std::{
     io::Cursor,
     time::Duration,
 };
-use tokio::time;
-use tracing::{info, warn};
+use tracing::info;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct Movie {
@@ -134,51 +133,9 @@ async fn main() -> anyhow::Result<()> {
         .context("loading gist")?;
     info!(count = storage.movies.len(), "loaded movies from gist");
 
-    if let Err(err) = refresh_from_rss(&mut storage, &client, &rss_url).await {
-        warn!(error = %err, "initial rss refresh failed");
-    }
-
-    let mut interval = time::interval(Duration::from_secs(60 * 60 * 24));
-    interval.tick().await; // consume the immediate first tick
-    let shutdown = shutdown_signal();
-    tokio::pin!(shutdown);
-
-    loop {
-        tokio::select! {
-            () = &mut shutdown => {
-                info!("shutting down");
-                break;
-            }
-            _ = interval.tick() => {
-                if let Err(err) = refresh_from_rss(&mut storage, &client, &rss_url).await {
-                    warn!(error = %err, "scheduled rss refresh failed");
-                }
-            }
-        }
-    }
+    refresh_from_rss(&mut storage, &client, &rss_url).await?;
 
     Ok(())
-}
-
-async fn shutdown_signal() {
-    let ctrl_c = tokio::signal::ctrl_c();
-    #[cfg(unix)]
-    {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut term) => {
-                tokio::select! {
-                    _ = ctrl_c => {}
-                    _ = term.recv() => {}
-                }
-            }
-            Err(err) => {
-                warn!(error = %err, "failed to install SIGTERM handler");
-                ctrl_c.await.ok();
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    ctrl_c.await.ok();
 }
 
 async fn refresh_from_rss(
